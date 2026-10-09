@@ -24,51 +24,223 @@ jobs:
       - name: Show toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           rustc --version
+          if ($LASTEXITCODE -ne 0) { throw "rustc failed" }
+
           cargo --version
+          if ($LASTEXITCODE -ne 0) { throw "cargo failed" }
+
           nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc failed" }
+
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+      - name: Verify build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (!(Test-Path SOURCE-PATCH-WINDOWS.diff)) {
+            throw "SOURCE-PATCH-WINDOWS.diff is missing"
+          }
+
+          if (!(Test-Path gather.fatbin.b64)) {
+            throw "gather.fatbin.b64 is missing"
+          }
+
+          $patch = Get-Content SOURCE-PATCH-WINDOWS.diff -Raw
+
+          foreach ($needle in @(
+            'MultiGpuBackend',
+            'gpu-devices',
+            'launch_multiply_fold',
+            'new_fused'
+          )) {
+            if ($patch -notmatch [regex]::Escape($needle)) {
+              throw "patch is missing required marker: $needle"
+            }
+          }
+
+          Write-Host "Build inputs look complete."
 
       - name: Clone Tenero gamma.1
         shell: pwsh
         run: |
-          git clone https://github.com/zad112/Tenero.git Tenero-src-gamma1
-          Set-Location Tenero-src-gamma1
-          git checkout v0.3.0-gamma.1
-          git status --short
+          $ErrorActionPreference = 'Stop'
 
-      - name: Apply old3n patch
+          git clone https://github.com/zad112/Tenero.git Tenero-src-gamma1
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+
+          Set-Location Tenero-src-gamma1
+
+          git checkout v0.3.0-gamma.1
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
+
+          $head = git rev-parse HEAD
+
+          if ($head -ne '5bc5b2527ec6addac1d3f861da746d502bc6b4cc') {
+            throw "unexpected gamma.1 commit: $head"
+          }
+
+      - name: Apply old3n source patch
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Set-Location Tenero-src-gamma1
-          git apply --check ..\SOURCE-PATCH.diff
-          git apply ..\SOURCE-PATCH.diff
-          git status --short
+
+          git apply --check ..\SOURCE-PATCH-WINDOWS.diff
+          if ($LASTEXITCODE -ne 0) {
+            throw "git apply --check failed"
+          }
+
+          git apply ..\SOURCE-PATCH-WINDOWS.diff
+          if ($LASTEXITCODE -ne 0) {
+            throw "git apply failed"
+          }
+
+          $status = git status --short
+          Write-Host $status
+
+          if ($status -notmatch 'tenero_miner.rs') {
+            throw "miner CLI patch was not applied"
+          }
+
+          if ($status -notmatch 'tenero-miner/src/gpu.rs') {
+            throw "multi-GPU backend patch was not applied"
+          }
+
+          if ($status -notmatch 'tenero-gpu/src/lib.rs') {
+            throw "GPU launch patch was not applied"
+          }
+
+      - name: Restore optimized gather fatbin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $b64 = (Get-Content gather.fatbin.b64 -Raw) -replace '\s',''
+
+          try {
+            $bytes = [Convert]::FromBase64String($b64)
+          }
+          catch {
+            throw "gather.fatbin.b64 is not valid Base64"
+          }
+
+          if ($bytes.Length -lt 100000) {
+            throw "decoded gather.fatbin is unexpectedly small: $($bytes.Length) bytes"
+          }
+
+          $dest = Join-Path $PWD 'Tenero-src-gamma1\crates\tenero-gpu\kernels\gather.fatbin'
+
+          [IO.File]::WriteAllBytes($dest, $bytes)
+
+          Write-Host "Restored gather.fatbin: $($bytes.Length) bytes"
+          Get-FileHash $dest -Algorithm SHA256
+
+      - name: Verify patched source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-Location Tenero-src-gamma1
+
+          $cli = Get-Content crates\tenero-app\src\bin\tenero_miner.rs -Raw
+          $gpu = Get-Content crates\tenero-miner\src\gpu.rs -Raw
+          $lib = Get-Content crates\tenero-gpu\src\lib.rs -Raw
+
+          if ($cli -notmatch 'gpu-devices') {
+            throw "--gpu-devices is absent from patched CLI source"
+          }
+
+          if ($gpu -notmatch 'MultiGpuBackend') {
+            throw "MultiGpuBackend is absent from patched source"
+          }
+
+          if ($lib -notmatch 'launch_multiply_fold') {
+            throw "launch_multiply_fold is absent from patched source"
+          }
+
+          Write-Host "Required multi-GPU and fused-kernel source is present."
 
       - name: Format check
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Set-Location Tenero-src-gamma1
+
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo fmt failed"
+          }
 
       - name: Cargo check
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Set-Location Tenero-src-gamma1
+
           cargo check --locked -p tenero-app --bin tenero-miner
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo check failed"
+          }
 
       - name: Build release
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Set-Location Tenero-src-gamma1
+
           cargo build --release --locked -p tenero-app --bin tenero-miner
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build failed"
+          }
+
+      - name: Verify Windows executable is really old3n multi-GPU
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $exe = 'Tenero-src-gamma1\target\release\tenero-miner.exe'
+
+          if (!(Test-Path $exe)) {
+            throw "tenero-miner.exe was not built"
+          }
+
+          $help = & $exe --help 2>&1 | Out-String
+
+          Write-Host $help
+
+          if ($help -notmatch '--gpu-devices') {
+            throw "built EXE is stock: --gpu-devices is missing"
+          }
+
+          if ($help -notmatch '--gpu-batches') {
+            throw "built EXE is stock: --gpu-batches is missing"
+          }
+
+          Write-Host "VERIFIED: Windows EXE contains native old3n multi-GPU CLI."
 
       - name: Package old3n-miner.exe
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          Copy-Item Tenero-src-gamma1\target\release\tenero-miner.exe package\old3n-miner.exe
-          Copy-Item SOURCE-PATCH.diff package\SOURCE-PATCH.diff
+
+          Copy-Item `
+            Tenero-src-gamma1\target\release\tenero-miner.exe `
+            package\old3n-miner.exe
+
+          Copy-Item `
+            SOURCE-PATCH-WINDOWS.diff `
+            package\SOURCE-PATCH.diff
 
           @"
           old3n-miner gamma.1 - Windows x64
@@ -93,18 +265,26 @@ jobs:
             --gpu-batches 512,512 ^
             --status-every 30
 
-          Multi-GPU --pool mode is not enabled in this build.
+          Multi-GPU --pool mode is not enabled in this build yet.
 
           Experimental / unaudited.
           "@ | Set-Content -Encoding UTF8 package\README-WINDOWS.txt
 
-          $hash = (Get-FileHash package\old3n-miner.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  old3n-miner.exe" | Set-Content -Encoding ASCII package\SHA256SUMS
+          $hash = (
+            Get-FileHash package\old3n-miner.exe -Algorithm SHA256
+          ).Hash.ToLower()
 
-          Compress-Archive -Path package\* -DestinationPath old3n-miner-gamma1-windows-x64.zip -Force
+          "$hash  old3n-miner.exe" |
+            Set-Content -Encoding ASCII package\SHA256SUMS
+
+          Compress-Archive `
+            -Path package\* `
+            -DestinationPath old3n-miner-gamma1-windows-x64.zip `
+            -Force
 
           Write-Host "EXE SHA256:"
           Get-Content package\SHA256SUMS
+
           Write-Host "ZIP SHA256:"
           Get-FileHash old3n-miner-gamma1-windows-x64.zip -Algorithm SHA256
 
