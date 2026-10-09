@@ -101,8 +101,9 @@ jobs:
             throw "git apply failed"
           }
 
-          $status = git status --short
+          $status = (git status --short) -join "`n"
           Write-Host $status
+        
 
           if ($status -notmatch 'tenero_miner.rs') {
             throw "miner CLI patch was not applied"
