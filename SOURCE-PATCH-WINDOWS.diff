@@ -1,0 +1,1828 @@
+diff --git a/crates/tenero-app/src/bin/tenero_miner.rs b/crates/tenero-app/src/bin/tenero_miner.rs
+index cf55c3c..51e5e6b 100644
+--- a/crates/tenero-app/src/bin/tenero_miner.rs
++++ b/crates/tenero-app/src/bin/tenero_miner.rs
+@@ -19,7 +19,7 @@ use tenero_app::ui::{
+ use tenero_chain::MatmulPow;
+ use tenero_core::matmulhash::Params;
+ use tenero_core::v2::ids::PowKind;
+-use tenero_miner::gpu::GpuBackend;
++use tenero_miner::gpu::{GpuBackend, MultiGpuBackend};
+ use tenero_miner::{CpuMatmulBackend, Miner, Sha256Backend, WalletPayout, MAX_CORES};
+ 
+ const USAGE: &str = "\
+@@ -45,6 +45,8 @@ tenero-miner: mines for a Tenero node in another process (EXPERIMENTAL, UNAUDITE
+   --backend B        sha256 (the test network), cpu or gpu (the dev network's matmulhash)
+   --cores N          CPU threads for the cpu backend, 1 to 6 (default 6)
+   --gpu-device N     which GPU (default 0)       --gpu-batch N|auto   attempts per batch (default 128; auto measures at start-up)
++  --gpu-devices LIST comma-separated GPUs, e.g. 0,1,2 (solo/local/remote node only in this build)
++  --gpu-batches LIST comma-separated batches matching --gpu-devices; omitted = --gpu-batch for every GPU
+   --pace SECS        wait this long after a block is found before the next job (default 0)
+   --log-level L      error, warn, info, debug (default info)    --log-file FILE   also log to this file
+   --status-file FILE rewrite this file every second with the miner's state, for a program that started it
+@@ -73,6 +75,8 @@ struct Args {
+     gpu_device: usize,
+     gpu_batch: usize,
+     gpu_batch_auto: bool,
++    gpu_devices: Option<Vec<usize>>,
++    gpu_batches: Option<Vec<usize>>,
+     pace: u64,
+     level: Level,
+     log_file: Option<PathBuf>,
+@@ -100,6 +104,8 @@ fn parse() -> Result<Args, String> {
+         gpu_device: 0,
+         gpu_batch: 128,
+         gpu_batch_auto: false,
++        gpu_devices: None,
++        gpu_batches: None,
+         pace: 0,
+         level: Level::Info,
+         log_file: None,
+@@ -193,6 +199,38 @@ fn parse() -> Result<Args, String> {
+             "gpu-device" => a.gpu_device = num("gpu-device")? as usize,
+             "gpu-batch" if v == "auto" => a.gpu_batch_auto = true,
+             "gpu-batch" => a.gpu_batch = num("gpu-batch")? as usize,
++            "gpu-devices" => {
++                let mut out = Vec::new();
++                for x in v.split(',') {
++                    if x.is_empty() {
++                        return Err("--gpu-devices: empty device number".into());
++                    }
++                    out.push(
++                        x.parse::<usize>()
++                            .map_err(|_| format!("--gpu-devices: `{x}` is not a number"))?,
++                    );
++                }
++                if out.is_empty() {
++                    return Err("--gpu-devices needs at least one GPU".into());
++                }
++                a.gpu_devices = Some(out);
++            }
++            "gpu-batches" => {
++                let mut out = Vec::new();
++                for x in v.split(',') {
++                    let b = x
++                        .parse::<usize>()
++                        .map_err(|_| format!("--gpu-batches: `{x}` is not a number"))?;
++                    if b == 0 {
++                        return Err("--gpu-batches values must be at least 1".into());
++                    }
++                    out.push(b);
++                }
++                if out.is_empty() {
++                    return Err("--gpu-batches needs at least one batch".into());
++                }
++                a.gpu_batches = Some(out);
++            }
+             "pace" => a.pace = num("pace")?,
+             "log-level" => {
+                 a.level = Level::parse(&v).ok_or_else(|| {
+@@ -259,6 +297,36 @@ fn parse() -> Result<Args, String> {
+     if a.gpu_batch == 0 {
+         return Err("--gpu-batch must be at least 1".into());
+     }
++    if let Some(devices) = &a.gpu_devices {
++        if a.backend != "gpu" {
++            return Err("--gpu-devices requires --backend gpu".into());
++        }
++        if seen.contains("gpu-device") {
++            return Err("--gpu-device and --gpu-devices cannot be combined".into());
++        }
++        if a.gpu_batch_auto {
++            return Err("--gpu-batch auto is not supported with --gpu-devices yet".into());
++        }
++        if devices.len() > 256 {
++            return Err("--gpu-devices supports at most 256 GPUs".into());
++        }
++        let mut unique = std::collections::BTreeSet::new();
++        if devices.iter().any(|d| !unique.insert(*d)) {
++            return Err("--gpu-devices contains the same GPU more than once".into());
++        }
++        if a.pool.is_some() {
++            return Err(
++                "--gpu-devices v1 supports solo/local/remote node mining; not --pool yet".into(),
++            );
++        }
++        if let Some(batches) = &a.gpu_batches {
++            if batches.len() != devices.len() {
++                return Err("--gpu-batches must have exactly one value per GPU".into());
++            }
++        }
++    } else if a.gpu_batches.is_some() {
++        return Err("--gpu-batches requires --gpu-devices".into());
++    }
+     Ok(a)
+ }
+ 
+@@ -517,24 +585,43 @@ fn main() {
+             Miner::spawn(move || Ok(CpuMatmulBackend::new(pow, epoch, cores, 10)))
+         }
+         _ => {
+-            let device = args.gpu_device;
+-            let batch = if args.gpu_batch_auto {
+-                let l = Arc::clone(&log);
+-                tenero_miner::gpu::auto_batch(
+-                    device,
+-                    Params::DEFAULT,
+-                    epoch,
+-                    args.gpu_batch,
+-                    &move |m| l.info(&format!("miner: {m}")),
+-                )
+-            } else {
+-                args.gpu_batch
+-            };
+             let gather_from = network.gather_from();
+-            Miner::spawn(move || {
+-                GpuBackend::new(device, Params::DEFAULT, epoch, batch)
+-                    .map(|b| b.gathered_from(gather_from))
+-            })
++            if let Some(devices) = args.gpu_devices.clone() {
++                let batches = args
++                    .gpu_batches
++                    .clone()
++                    .unwrap_or_else(|| vec![args.gpu_batch; devices.len()]);
++                let specs: Vec<(usize, usize)> = devices.into_iter().zip(batches).collect();
++                log.info(&format!(
++                    "multi-GPU: {}",
++                    specs
++                        .iter()
++                        .map(|(d, b)| format!("GPU {d} batch {b}"))
++                        .collect::<Vec<_>>()
++                        .join(", ")
++                ));
++                Miner::spawn(move || {
++                    MultiGpuBackend::new(&specs, Params::DEFAULT, epoch, gather_from)
++                })
++            } else {
++                let device = args.gpu_device;
++                let batch = if args.gpu_batch_auto {
++                    let l = Arc::clone(&log);
++                    tenero_miner::gpu::auto_batch(
++                        device,
++                        Params::DEFAULT,
++                        epoch,
++                        args.gpu_batch,
++                        &move |m| l.info(&format!("miner: {m}")),
++                    )
++                } else {
++                    args.gpu_batch
++                };
++                Miner::spawn(move || {
++                    GpuBackend::new(device, Params::DEFAULT, epoch, batch)
++                        .map(|b| b.gathered_from(gather_from))
++                })
++            }
+         }
+     };
+     let l = Arc::clone(&log);
+@@ -630,8 +717,14 @@ fn main() {
+         let pool_mode = args.pool.is_some();
+         let status_file = args.status_file.clone();
+         // the card's health for the screen (GPU only); if NVML cannot be read the miner is not affected
++        let probe_device = args
++            .gpu_devices
++            .as_ref()
++            .and_then(|d| d.first())
++            .copied()
++            .unwrap_or(args.gpu_device);
+         let probe = if args.backend == "gpu" {
+-            match tenero_miner::gpu_stats::GpuProbe::open(args.gpu_device) {
++            match tenero_miner::gpu_stats::GpuProbe::open(probe_device) {
+                 Ok(p) => Some(p),
+                 Err(e) => {
+                     log.info(&format!("GPU readings are not available: {e}"));
+diff --git a/crates/tenero-gpu/examples/gather_bench.rs b/crates/tenero-gpu/examples/gather_bench.rs
+index 0613403..8919e9d 100644
+--- a/crates/tenero-gpu/examples/gather_bench.rs
++++ b/crates/tenero-gpu/examples/gather_bench.rs
+@@ -1,17 +1,36 @@
+-//! The gather PROTOTYPE's speed (`tenero_gpu::gather`, not consensus), next to the card's own memory bandwidth.
++//! The gathered attempt's speed (`tenero_gpu::gather`), next to the card's own memory bandwidth.
+ //!
+ //!     cargo run --release -p tenero-gpu --example gather_bench [-- --seconds 5]
+ //!
+ //! Needs an NVIDIA GPU and about 4.5 GiB of video memory plus the batch buffers. What it prints is MEASURED on this
+-//! machine. One batch at a time (no pipeline), with the same seeds every batch (their columns are spread over the
+-//! whole 4 GiB, so no batch is helped by the cache).
++//! machine. It reports both the synchronous API and the two-batch pipeline used by the miner. Seeds change between
++//! pipelined batches so neither the dataset columns nor their index stream can be reused from cache.
+ 
+-use std::time::Instant;
++use std::hint::black_box;
++use std::time::{Duration, Instant};
+ use tenero_core::matmulhash::{self as mh, Params};
++use tenero_core::u256::U256;
+ use tenero_gpu::gather::GatherEngine;
+ use tenero_gpu::group::SliceGrouper;
+ use tenero_gpu::Gpu;
+ 
++fn submit_gathered(
++    engine: &mut GatherEngine<'_>,
++    header: &[u8; 32],
++    batch: usize,
++    nonce: &mut u64,
++) -> Duration {
++    let started = Instant::now();
++    let first = *nonce;
++    let seeds = (0..batch as u64)
++        .map(|i| mh::attempt_seed(header, first.wrapping_add(i)))
++        .collect();
++    *nonce = nonce.wrapping_add(batch as u64);
++    let elapsed = started.elapsed();
++    engine.submit(seeds, false).unwrap();
++    elapsed
++}
++
+ fn main() {
+     let args: Vec<String> = std::env::args().collect();
+     let seconds: f64 = args
+@@ -19,14 +38,25 @@ fn main() {
+         .position(|a| a == "--seconds")
+         .and_then(|i| args.get(i + 1))
+         .map_or(5.0, |s| s.parse().expect("seconds"));
++    let profile = args.iter().any(|a| a == "--profile");
++    let pipeline_only = args.iter().any(|a| a == "--pipeline-only");
++    let synchronous = args.iter().any(|a| a == "--synchronous");
++    let fused = args.iter().any(|a| a == "--fused");
++    let only_batch: Option<usize> = args
++        .iter()
++        .position(|a| a == "--batch")
++        .and_then(|i| args.get(i + 1))
++        .map(|s| s.parse().expect("batch"));
+     let p = Params::DEFAULT;
+     let g = Gpu::new(0).expect("start the GPU");
+     println!("device: {}", g.name);
+ 
+-    let (gbs, _) = g.copy_bandwidth(1 << 30, seconds).expect("copy test");
+-    println!(
+-        "device-to-device copy of 1 GiB: {gbs:.0} GB/s of reads plus writes (the practical memory bandwidth)"
+-    );
++    if !pipeline_only {
++        let (gbs, _) = g.copy_bandwidth(1 << 30, seconds).expect("copy test");
++        println!(
++            "device-to-device copy of 1 GiB: {gbs:.0} GB/s of reads plus writes (the practical memory bandwidth)"
++        );
++    }
+ 
+     let dev = g
+         .build_dataset(&p, &mh::epoch_seed(0), p.num_blocks)
+@@ -35,7 +65,7 @@ fn main() {
+     let header = [1u8; 32];
+     let column_bytes = (p.nb * p.k) as f64; // read per attempt: nb columns of k bytes = 16 MiB
+ 
+-    {
++    if !pipeline_only {
+         // the access pattern alone: no multiply, `piece` bytes of each of a block's 128 columns per step
+         let batch = 256;
+         let mut engine = GatherEngine::new(&g, &dev, batch).expect("engine");
+@@ -57,70 +87,199 @@ fn main() {
+         }
+     }
+ 
++    if !pipeline_only {
++        println!(
++            "\n{:>7} {:>16} {:>14} {:>12}",
++            "batch", "columns", "attempts/s", "GB/s read"
++        );
++        for batch in [32usize, 64, 128, 256, 512] {
++            let mut engine = match GatherEngine::new(&g, &dev, batch) {
++                Ok(e) => e,
++                Err(e) => {
++                    println!("{batch:>7}  cannot start: {e}");
++                    continue;
++                }
++            };
++            let seeds: Vec<[u8; 32]> = (0..batch as u64)
++                .map(|n| mh::attempt_seed(&header, n))
++                .collect();
++            for (same, what) in [(false, "its own"), (true, "all the same")] {
++                engine.attempts(&seeds, same).unwrap(); // warm up
++                let start = Instant::now();
++                let mut total = 0u64;
++                while start.elapsed().as_secs_f64() < seconds {
++                    engine.attempts(&seeds, same).unwrap();
++                    total += batch as u64;
++                }
++                let rate = total as f64 / start.elapsed().as_secs_f64();
++                let read = if same {
++                    column_bytes / batch as f64
++                } else {
++                    column_bytes
++                };
++                println!(
++                    "{batch:>7} {what:>16} {rate:>14.0} {:>12.0}",
++                    rate * read / 1e9
++                );
++            }
++        }
++    }
++
++    if synchronous {
++        println!("\nthe gathered synchronous path (pinned staging, changing nonces):");
++    } else {
++        println!("\nthe gathered miner pipeline (two slots, changing nonces):");
++    }
+     println!(
+-        "\n{:>7} {:>16} {:>14} {:>12}",
+-        "batch", "columns", "attempts/s", "GB/s read"
++        "{:>7} {:>14} {:>12} {:>14}",
++        "batch", "attempts/s", "GB/s read", "buffers GiB"
+     );
+-    for batch in [32usize, 64, 128, 256, 512] {
+-        let mut engine = match GatherEngine::new(&g, &dev, batch) {
++    for batch in [256usize, 512, 768, 1024, 1536, 2048] {
++        if only_batch.is_some_and(|only| only != batch) {
++            continue;
++        }
++        let engine = if fused {
++            GatherEngine::new_fused(&g, &dev, batch)
++        } else {
++            GatherEngine::new(&g, &dev, batch)
++        };
++        let mut engine = match engine {
+             Ok(e) => e,
+             Err(e) => {
+                 println!("{batch:>7}  cannot start: {e}");
+                 continue;
+             }
+         };
+-        let seeds: Vec<[u8; 32]> = (0..batch as u64)
+-            .map(|n| mh::attempt_seed(&header, n))
+-            .collect();
+-        for (same, what) in [(false, "its own"), (true, "all the same")] {
+-            engine.attempts(&seeds, same).unwrap(); // warm up
+-            let start = Instant::now();
++        let slot_bytes = batch
++            * (2 * 8 * std::mem::size_of::<i64>()
++                + p.m * p.k
++                + p.nb * std::mem::size_of::<u32>()
++                + std::mem::size_of::<u32>()
++                + usize::from(!fused) * p.m * p.nb * std::mem::size_of::<i32>()
++                + 8 * std::mem::size_of::<u64>());
++        let read_test_bytes = batch * (p.nb / 128) * 256 * std::mem::size_of::<u32>();
++        let buffers_gib = (2 * slot_bytes + read_test_bytes) as f64 / (1u64 << 30) as f64;
++        let mut nonce = 0u64;
++        if synchronous {
++            let mut run = || {
++                let first = nonce;
++                let seeds: Vec<[u8; 32]> = (0..batch as u64)
++                    .map(|i| mh::attempt_seed(&header, first.wrapping_add(i)))
++                    .collect();
++                nonce = nonce.wrapping_add(batch as u64);
++                let attempts = engine.attempts(&seeds, false).unwrap();
++                for attempt in &attempts {
++                    black_box(mh::meets_target(&attempt.digest, &U256::ZERO));
++                }
++            };
++            for _ in 0..4 {
++                run();
++            }
++            let started = Instant::now();
+             let mut total = 0u64;
+-            while start.elapsed().as_secs_f64() < seconds {
+-                engine.attempts(&seeds, same).unwrap();
++            while started.elapsed().as_secs_f64() < seconds {
++                run();
+                 total += batch as u64;
+             }
+-            let rate = total as f64 / start.elapsed().as_secs_f64();
+-            let read = if same {
+-                column_bytes / batch as f64
+-            } else {
+-                column_bytes
+-            };
++            let rate = total as f64 / started.elapsed().as_secs_f64();
+             println!(
+-                "{batch:>7} {what:>16} {rate:>14.0} {:>12.0}",
+-                rate * read / 1e9
++                "{batch:>7} {rate:>14.0} {:>12.0} {buffers_gib:>14.2}",
++                rate * column_bytes / 1e9
+             );
++            continue;
+         }
+-    }
+-    // the FIRST design (a whole slice per attempt) on our own multiply, nonces grouped by slice: what the miner can do
+-    // without cuBLASLt (gpu_bench's grouped table is the cuBLASLt figure to compare with)
+-    println!("\nthe first design on our own multiply (no cuBLASLt), nonces grouped by slice:");
+-    println!("{:>7} {:>7} {:>14}", "group", "batch", "attempts/s");
+-    for group in [1usize, 8, 16, 32] {
+-        for batch in [256usize, 512] {
+-            let mut engine = GatherEngine::new(&g, &dev, batch).unwrap();
+-            let mut grouper = SliceGrouper::new(header, p.num_blocks, group, 0);
+-            let mut run = |grouper: &mut SliceGrouper| {
+-                let b = grouper.next_batch(batch / group);
+-                engine.slice_attempts(&b.seeds, &b.slices).unwrap();
+-                b.len() as u64
+-            };
+-            for _ in 0..3 {
+-                run(&mut grouper);
+-            }
+-            let start = Instant::now();
+-            let mut total = 0u64;
+-            while start.elapsed().as_secs_f64() < seconds {
+-                total += run(&mut grouper);
++        while engine.in_flight() < 2 {
++            submit_gathered(&mut engine, &header, batch, &mut nonce);
++        }
++        // Warm enough to fill both slots and leave the same steady-state queue depth used for the measurement.
++        for _ in 0..4 {
++            engine.collect().unwrap().unwrap();
++            submit_gathered(&mut engine, &header, batch, &mut nonce);
++        }
++        while engine.in_flight() != 0 {
++            engine.collect().unwrap().unwrap();
++        }
++        engine.set_profiling(profile);
++        let start = Instant::now();
++        let mut seed_time = Duration::ZERO;
++        let mut target_time = Duration::ZERO;
++        let mut submitted = 0u64;
++        while engine.in_flight() < 2 {
++            seed_time += submit_gathered(&mut engine, &header, batch, &mut nonce);
++            submitted += 1;
++        }
++        let mut total = 0u64;
++        while start.elapsed().as_secs_f64() < seconds {
++            let attempts = engine.collect().unwrap().unwrap();
++            total += batch as u64;
++            if profile {
++                let target_started = Instant::now();
++                for attempt in &attempts {
++                    black_box(mh::meets_target(&attempt.digest, &U256::ZERO));
++                }
++                target_time += target_started.elapsed();
+             }
++            seed_time += submit_gathered(&mut engine, &header, batch, &mut nonce);
++            submitted += 1;
++        }
++        let elapsed = start.elapsed().as_secs_f64();
++        let rate = total as f64 / elapsed;
++        println!(
++            "{batch:>7} {rate:>14.0} {:>12.0} {buffers_gib:>14.2}",
++            rate * column_bytes / 1e9
++        );
++        if profile {
++            let p = engine.take_profile();
++            let gpu_batches = p.batches.max(1) as f64;
++            let cpu_ms = |d: Duration, batches: f64| d.as_secs_f64() * 1e3 / batches;
+             println!(
+-                "{group:>7} {batch:>7} {:>14.0}",
+-                total as f64 / start.elapsed().as_secs_f64()
++                "        profile ms/batch: nonce+seed {:.3}, keys {:.3}, pick_keys {:.3}, HtoD {:.3}, X {:.3}, indexes {:.3}, gather {:.3}, fold {:.3}, DtoH {:.3}, wait {:.3}, mix+digest {:.3}, target {:.3}",
++                cpu_ms(seed_time, submitted.max(1) as f64),
++                cpu_ms(p.prepare_keys, gpu_batches),
++                cpu_ms(p.prepare_pick_keys, gpu_batches),
++                p.h_to_d_ms / gpu_batches,
++                p.x_ms / gpu_batches,
++                p.indexes_ms / gpu_batches,
++                p.gather_gemm_ms / gpu_batches,
++                p.fold_ms / gpu_batches,
++                p.d_to_h_ms / gpu_batches,
++                cpu_ms(p.collect_wait, gpu_batches),
++                cpu_ms(p.mix_digest, gpu_batches),
++                cpu_ms(target_time, (total / batch as u64).max(1) as f64),
+             );
+         }
+     }
+-    println!("\n'all the same' gives WRONG results: every attempt reads attempt 0's columns. No miner can choose nonces that");
+-    println!(
+-        "do this; it shows what the gathered design would cost if reading the columns were free."
+-    );
++    if !pipeline_only {
++        // The FIRST design (a whole slice per attempt) on our own multiply, nonces grouped by slice: what the miner can
++        // do without cuBLASLt (gpu_bench's grouped table is the cuBLASLt figure to compare with).
++        println!("\nthe first design on our own multiply (no cuBLASLt), nonces grouped by slice:");
++        println!("{:>7} {:>7} {:>14}", "group", "batch", "attempts/s");
++        for group in [1usize, 8, 16, 32] {
++            for batch in [256usize, 512] {
++                let mut engine = GatherEngine::new(&g, &dev, batch).unwrap();
++                let mut grouper = SliceGrouper::new(header, p.num_blocks, group, 0);
++                let mut run = |grouper: &mut SliceGrouper| {
++                    let b = grouper.next_batch(batch / group);
++                    engine.slice_attempts(&b.seeds, &b.slices).unwrap();
++                    b.len() as u64
++                };
++                for _ in 0..3 {
++                    run(&mut grouper);
++                }
++                let start = Instant::now();
++                let mut total = 0u64;
++                while start.elapsed().as_secs_f64() < seconds {
++                    total += run(&mut grouper);
++                }
++                println!(
++                    "{group:>7} {batch:>7} {:>14.0}",
++                    total as f64 / start.elapsed().as_secs_f64()
++                );
++            }
++        }
++        println!("\n'all the same' gives WRONG results: every attempt reads attempt 0's columns. No miner can choose nonces that");
++        println!(
++            "do this; it shows what the gathered design would cost if reading the columns were free."
++        );
++    }
+ }
+diff --git a/crates/tenero-gpu/kernels/gather.cu b/crates/tenero-gpu/kernels/gather.cu
+index 474c146..5318581 100644
+--- a/crates/tenero-gpu/kernels/gather.cu
++++ b/crates/tenero-gpu/kernels/gather.cu
+@@ -32,6 +32,10 @@ __device__ __forceinline__ void g_cp_async_wait_one() {
+     asm volatile("cp.async.wait_group 1;\n" ::);
+ }
+ 
++__device__ __forceinline__ void g_cp_async_wait_all() {
++    asm volatile("cp.async.wait_all;\n" ::);
++}
++
+ __device__ __forceinline__ void g_ldmatrix_x4(unsigned r[4], const void* smem) {
+     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+@@ -45,6 +49,39 @@ __device__ __forceinline__ void g_mma(int c[4], const unsigned a[4], const unsig
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+ }
+ 
++// Kept local to this module, but bit for bit identical to matmulhash.cu's chacha_core. The fused kernel applies it to
++// exactly the same 16-word chunks and chunk numbers as fold_fast, after staging one complete 64 x 128 C tile in shared
++// memory. This avoids writing that tile to global memory and reading it back.
++__device__ __forceinline__ unsigned gf_rotl32(unsigned x, int n) {
++    return (x << n) | (x >> (32 - n));
++}
++
++__device__ __forceinline__ void gf_quarter_round(unsigned &a, unsigned &b, unsigned &c, unsigned &d) {
++    a += b; d ^= a; d = gf_rotl32(d, 16);
++    c += d; b ^= c; b = gf_rotl32(b, 12);
++    a += b; d ^= a; d = gf_rotl32(d, 8);
++    c += d; b ^= c; b = gf_rotl32(b, 7);
++}
++
++__device__ __forceinline__ void gf_chacha_core(unsigned x[16]) {
++    unsigned s[16];
++    #pragma unroll
++    for (int i = 0; i < 16; ++i) s[i] = x[i];
++    #pragma unroll
++    for (int r = 0; r < 10; ++r) {
++        gf_quarter_round(x[0], x[4], x[8],  x[12]);
++        gf_quarter_round(x[1], x[5], x[9],  x[13]);
++        gf_quarter_round(x[2], x[6], x[10], x[14]);
++        gf_quarter_round(x[3], x[7], x[11], x[15]);
++        gf_quarter_round(x[0], x[5], x[10], x[15]);
++        gf_quarter_round(x[1], x[6], x[11], x[12]);
++        gf_quarter_round(x[2], x[7], x[8],  x[13]);
++        gf_quarter_round(x[3], x[4], x[9],  x[14]);
++    }
++    #pragma unroll
++    for (int i = 0; i < 16; ++i) x[i] += s[i];
++}
++
+ extern "C" {
+ 
+ // grid = (nb / 128, attempts), 256 threads, G_SMEM bytes of dynamic shared memory. The column tile is blockIdx.x, so the
+@@ -183,6 +220,175 @@ __global__ void __launch_bounds__(256) gather_gemm(const unsigned long long x_pt
+     }
+ }
+ 
++// Experimental exact fusion of gather_gemm and fold_fast. The MMA loop and accumulator mapping are deliberately kept
++// identical to gather_gemm. Instead of writing C to global memory, each block stages its 64 x 128 result tile in the
++// now-dead pipeline shared memory. Its 512 consecutive 16-word chunks then receive the exact global chunk number used
++// by fold_fast, the same ChaCha20 transform and the same eight unsigned 64-bit sums. One atomic per result word and
++// column tile combines the 16 blocks of an attempt; unsigned addition makes their order immaterial.
++// grid = (nb / 128, attempts), 256 threads, G_SMEM bytes of dynamic shared memory. `sums` must be zeroed first.
++__global__ void __launch_bounds__(256) gather_gemm_fold(const unsigned long long x_ptr,
++                                                        const unsigned long long data_ptr,
++                                                        const unsigned long long idx_ptr,
++                                                        const unsigned long long sums_ptr,
++                                                        const unsigned k,
++                                                        const unsigned nb,
++                                                        const unsigned columns,
++                                                        const unsigned idx_stride,
++                                                        const unsigned long long slices_ptr,
++                                                        const unsigned slice_mode)
++{
++    extern __shared__ __align__(16) unsigned char smem[];
++    unsigned char* sx = smem;
++    unsigned char* sw = smem + G_STAGES * G_SX;
++
++    const unsigned a = blockIdx.y;
++    const unsigned n0 = blockIdx.x * G_BN;
++    const unsigned char* X = (const unsigned char*)x_ptr + (unsigned long long)a * 64ull * k;
++    const unsigned char* D = (const unsigned char*)data_ptr;
++    const unsigned* idx = (const unsigned*)idx_ptr + (unsigned long long)a * idx_stride;
++    const unsigned long long slice_first =
++        slice_mode ? (unsigned long long)((const unsigned*)slices_ptr)[a] * nb : 0ull;
++    unsigned long long* sums = (unsigned long long*)sums_ptr + (unsigned long long)a * 8ull;
++
++    const unsigned tid = threadIdx.x;
++    const unsigned pc = (tid & 7u) * 16u;
++    const unsigned char* xsrc[2];
++    const unsigned char* wsrc[4];
++    unsigned xdst[2], wdst[4];
++    #pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        const unsigned row = (tid >> 3) + i * 32;
++        xsrc[i] = X + (unsigned long long)row * k + pc;
++        xdst[i] = row * G_STRIDE + pc;
++    }
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const unsigned col = (tid >> 3) + i * 32;
++        const unsigned long long column =
++            slice_mode ? slice_first + n0 + col : (unsigned long long)(idx[n0 + col] % columns);
++        wsrc[i] = D + column * k + pc;
++        wdst[i] = col * G_STRIDE + pc;
++    }
++    const unsigned ktiles = k / G_BK;
++
++    const unsigned warp = tid >> 5, lane = tid & 31u;
++    const unsigned wm = (warp & 1u) * 32u;
++    const unsigned wn = (warp >> 1) * 32u;
++    const unsigned g = lane >> 2, t = lane & 3u;
++    const unsigned q = lane >> 3, r8 = lane & 7u;
++    const unsigned a_off = ((q & 1u) * 8u + r8) * G_STRIDE + (q >> 1) * 16u;
++    const unsigned b_off = ((q >> 1) * 8u + r8) * G_STRIDE + (q & 1u) * 16u;
++
++    int acc[2][4][4];
++    #pragma unroll
++    for (int i = 0; i < 2; ++i)
++        #pragma unroll
++        for (int j = 0; j < 4; ++j)
++            #pragma unroll
++            for (int r = 0; r < 4; ++r)
++                acc[i][j][r] = 0;
++
++    #pragma unroll
++    for (unsigned s = 0; s < G_STAGES - 1; ++s) {
++        if (s < ktiles) {
++            const unsigned off = s * G_BK;
++            #pragma unroll
++            for (int i = 0; i < 2; ++i) g_cp_async16(sx + s * G_SX + xdst[i], xsrc[i] + off);
++            #pragma unroll
++            for (int i = 0; i < 4; ++i) g_cp_async16(sw + s * G_SW + wdst[i], wsrc[i] + off);
++        }
++        g_cp_async_commit();
++    }
++
++    for (unsigned kt = 0; kt < ktiles; ++kt) {
++        g_cp_async_wait_one();
++        __syncthreads();
++        const unsigned nk = kt + G_STAGES - 1;
++        if (nk < ktiles) {
++            const unsigned s = nk % G_STAGES;
++            const unsigned off = nk * G_BK;
++            #pragma unroll
++            for (int i = 0; i < 2; ++i) g_cp_async16(sx + s * G_SX + xdst[i], xsrc[i] + off);
++            #pragma unroll
++            for (int i = 0; i < 4; ++i) g_cp_async16(sw + s * G_SW + wdst[i], wsrc[i] + off);
++        }
++        g_cp_async_commit();
++
++        const unsigned char* xs = sx + (kt % G_STAGES) * G_SX;
++        const unsigned char* ws = sw + (kt % G_STAGES) * G_SW;
++        #pragma unroll
++        for (unsigned ks = 0; ks < G_BK; ks += 32) {
++            unsigned af[2][4];
++            unsigned bf[2][4];
++            #pragma unroll
++            for (int i = 0; i < 2; ++i)
++                g_ldmatrix_x4(af[i], xs + (wm + i * 16) * G_STRIDE + ks + a_off);
++            #pragma unroll
++            for (int p = 0; p < 2; ++p)
++                g_ldmatrix_x4(bf[p], ws + (wn + p * 16) * G_STRIDE + ks + b_off);
++            #pragma unroll
++            for (int i = 0; i < 2; ++i)
++                #pragma unroll
++                for (int j = 0; j < 4; ++j)
++                    g_mma(acc[i][j], af[i], bf[j >> 1][(j & 1) * 2], bf[j >> 1][(j & 1) * 2 + 1]);
++        }
++    }
++
++    // No asynchronous copy may still target smem when it is reused for C.
++    g_cp_async_wait_all();
++    __syncthreads();
++    unsigned* c_tile = (unsigned*)smem;
++    #pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        #pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const unsigned row = wm + i * 16 + g;
++            const unsigned col = wn + j * 8 + t * 2;
++            *(int2*)&c_tile[row * G_BN + col] = make_int2(acc[i][j][0], acc[i][j][1]);
++            *(int2*)&c_tile[(row + 8) * G_BN + col] = make_int2(acc[i][j][2], acc[i][j][3]);
++        }
++    }
++    __syncthreads();
++
++    // There are 512 16-word chunks in a 64 x 128 tile, exactly two per thread.
++    unsigned long long fold_acc[8];
++    #pragma unroll
++    for (int i = 0; i < 8; ++i) fold_acc[i] = 0ull;
++    #pragma unroll
++    for (unsigned local_chunk = tid; local_chunk < 512u; local_chunk += 256u) {
++        unsigned x[16];
++        #pragma unroll
++        for (int i = 0; i < 16; ++i) x[i] = c_tile[local_chunk * 16u + i];
++        const unsigned row = local_chunk >> 3;
++        const unsigned chunk_in_row = local_chunk & 7u;
++        const unsigned global_chunk = row * (nb >> 4) + (n0 >> 4) + chunk_in_row;
++        x[0] ^= global_chunk;
++        gf_chacha_core(x);
++        #pragma unroll
++        for (int i = 0; i < 8; ++i)
++            fold_acc[i] += (unsigned long long)x[i] + (unsigned long long)x[i + 8];
++    }
++
++    // First reduce within each warp, then within the block: eight atomics per C tile rather than 64.
++    // Every warp must finish reading c_tile before its first bytes are reused as warp_sums.
++    __syncthreads();
++    unsigned long long* warp_sums = (unsigned long long*)smem;
++    #pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        unsigned long long v = fold_acc[i];
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
++        if (lane == 0u) warp_sums[warp * 8u + i] = v;
++    }
++    __syncthreads();
++    if (warp == 0u && lane < 8u) {
++        unsigned long long total = 0ull;
++        #pragma unroll
++        for (int w = 0; w < 8; ++w) total += warp_sums[w * 8 + lane];
++        atomicAdd(&sums[lane], total);
++    }
++}
++
+ // A memory test, no multiply: reads gathered columns in the same order as gather_gemm, but `piece` bytes of each column
+ // per step (gather_gemm uses 64), so the bandwidth of that access pattern can be measured on its own. grid =
+ // (nb / 128, attempts), 256 threads; piece is a multiple of 16 dividing k, 16 to 1024. Writes one word per thread.
+diff --git a/crates/tenero-gpu/kernels/kernels.sha256 b/crates/tenero-gpu/kernels/kernels.sha256
+index 3251fc7..82ea899 100644
+--- a/crates/tenero-gpu/kernels/kernels.sha256
++++ b/crates/tenero-gpu/kernels/kernels.sha256
+@@ -1,4 +1,4 @@
+-986eede7a393a261e2a852fde1006ebe42cbd814871439253c0e7956ec9963f3  gather
++13a157e32f390407a3911da06e366a4b6a30ef8a2f4185ed3d9740431a8f422b  gather
+ c0ed72259180ec65a9236849f025fc7d15ad121b41320882672e0e049e1ef20b  matmulhash
+-# built by: NVRTC 13.4; ptxas Cuda compilation tools, release 13.4, V13.4.59
++# built by: NVRTC 13.4; ptxas Cuda compilation tools, release 13.4, V13.4.92
+ # targets: sm_80 sm_86 sm_89 sm_90 sm_100 sm_103 sm_120 + compute_80 PTX
+diff --git a/crates/tenero-gpu/src/gather.rs b/crates/tenero-gpu/src/gather.rs
+index fae626c..d7842ec 100644
+--- a/crates/tenero-gpu/src/gather.rs
++++ b/crates/tenero-gpu/src/gather.rs
+@@ -11,24 +11,69 @@
+ //! (`BENCHMARKS.md`): about 45,000 attempts/s, at the card's memory bandwidth.
+ 
+ use crate::{key_words_i64, DeviceDataset, Gpu, GpuError, THREADS};
+-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
++use cudarc::driver::sys::CUevent_flags;
++use cudarc::driver::{
++    CudaContext, CudaEvent, CudaSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
++};
++use std::collections::VecDeque;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
+ use tenero_core::matmulhash::{self as mh, Attempt};
+ 
+-/// Batches of attempts on the GPU with our own multiply (`gather.cu`), one batch at a time: the gathered attempt
+-/// (`attempts`) or the first design (`slice_attempts`).
++/// Batches of attempts on the GPU with our own multiply (`gather.cu`). Gathered batches can be pipelined with
++/// [`GatherEngine::submit`] and [`GatherEngine::collect`]; the synchronous helpers remain for tests and benchmarks.
+ pub struct GatherEngine<'a> {
+     gpu: &'a Gpu,
+     data: &'a DeviceDataset,
+     read_out: CudaSlice<u32>,
+     batch: usize,
++    slots: Vec<GatherSlot>,
++    next: usize,
++    queue: VecDeque<usize>,
++    fused_fold: bool,
++    profiling: bool,
++    profile: GatherProfile,
++}
++
++/// Device buffers and page-locked staging memory for one batch. There are two slots, but only one dataset.
++struct GatherSlot {
+     keys: CudaSlice<i64>,
++    keys_host: PinnedHostSlice<i64>,
+     pick_keys: CudaSlice<i64>,
++    pick_keys_host: PinnedHostSlice<i64>,
+     x: CudaSlice<u8>,
+     idx: CudaSlice<u8>,
+-    /// The slice of each attempt, for the first design (`slice_attempts`).
+     slices: CudaSlice<u32>,
+-    c: CudaSlice<i32>,
++    slices_host: PinnedHostSlice<u32>,
++    c: Option<CudaSlice<i32>>,
+     sums: CudaSlice<u64>,
++    sums_host: PinnedHostSlice<u64>,
++    pending: Option<Pending>,
++}
++
++struct Pending {
++    seeds: Vec<[u8; 32]>,
++    columns: OwnedColumns,
++    events: Option<Vec<CudaEvent>>,
++}
++
++/// Accumulated timings since profiling was enabled or the last [`GatherEngine::take_profile`]. GPU stages are measured
++/// by CUDA events; CPU stages and collection wait are wall-clock durations. Profiling adds event overhead and is meant
++/// to identify a bottleneck, not to produce the final attempts/s figure.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct GatherProfile {
++    pub batches: u64,
++    pub attempts: u64,
++    pub prepare_keys: Duration,
++    pub prepare_pick_keys: Duration,
++    pub h_to_d_ms: f64,
++    pub x_ms: f64,
++    pub indexes_ms: f64,
++    pub gather_gemm_ms: f64,
++    pub fold_ms: f64,
++    pub d_to_h_ms: f64,
++    pub collect_wait: Duration,
++    pub mix_digest: Duration,
+ }
+ 
+ /// Which columns the attempts of a batch read.
+@@ -39,11 +84,47 @@ enum Columns<'s> {
+     Slices(&'s [usize]),
+ }
+ 
++enum OwnedColumns {
++    Gathered,
++    Slices(Vec<usize>),
++}
++
++/// Allocates initialized page-locked memory. Initialization matters for a short final batch because cudarc copies the
++/// whole allocation, not only the prefix filled for that batch.
++fn pinned<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy + Default>(
++    ctx: &Arc<CudaContext>,
++    len: usize,
++) -> Result<PinnedHostSlice<T>, GpuError> {
++    // SAFETY: every element is initialized immediately, before CUDA or Rust reads the allocation.
++    #[allow(unsafe_code)]
++    let mut out = unsafe { ctx.alloc_pinned_with_flags::<T>(len, 0)? };
++    out.as_mut_slice()?.fill(T::default());
++    Ok(out)
++}
++
+ impl<'a> GatherEngine<'a> {
+     pub fn new(
+         gpu: &'a Gpu,
+         data: &'a DeviceDataset,
+         batch: usize,
++    ) -> Result<GatherEngine<'a>, GpuError> {
++        Self::new_with_fold(gpu, data, batch, false)
++    }
++
++    /// Creates an engine using the exact fused `gather_gemm + fold` kernel and therefore allocates no intermediate C.
++    pub fn new_fused(
++        gpu: &'a Gpu,
++        data: &'a DeviceDataset,
++        batch: usize,
++    ) -> Result<GatherEngine<'a>, GpuError> {
++        Self::new_with_fold(gpu, data, batch, true)
++    }
++
++    fn new_with_fold(
++        gpu: &'a Gpu,
++        data: &'a DeviceDataset,
++        batch: usize,
++        fused_fold: bool,
+     ) -> Result<GatherEngine<'a>, GpuError> {
+         let p = data.params;
+         if p.m != 64 || !p.k.is_multiple_of(128) || !p.nb.is_multiple_of(128) {
+@@ -58,24 +139,68 @@ impl<'a> GatherEngine<'a> {
+             return Err(GpuError::new("the batch must be 1..=65535"));
+         }
+         let s = &gpu.stream;
++        let ctx = s.context();
++        let mut slots = Vec::with_capacity(2);
++        for _ in 0..2 {
++            slots.push(GatherSlot {
++                keys: s.alloc_zeros::<i64>(batch * 8)?,
++                keys_host: pinned(ctx, batch * 8)?,
++                pick_keys: s.alloc_zeros::<i64>(batch * 8)?,
++                pick_keys_host: pinned(ctx, batch * 8)?,
++                x: s.alloc_zeros::<u8>(batch * p.m * p.k)?,
++                idx: s.alloc_zeros::<u8>(batch * p.nb * 4)?,
++                slices: s.alloc_zeros::<u32>(batch)?,
++                slices_host: pinned(ctx, batch)?,
++                c: if fused_fold {
++                    None
++                } else {
++                    Some(s.alloc_zeros::<i32>(batch * p.m * p.nb)?)
++                },
++                sums: s.alloc_zeros::<u64>(batch * 8)?,
++                sums_host: pinned(ctx, batch * 8)?,
++                pending: None,
++            });
++        }
+         Ok(GatherEngine {
+             gpu,
+             data,
+             read_out: s.alloc_zeros::<u32>(batch * (p.nb / 128) * 256)?,
+             batch,
+-            keys: s.alloc_zeros::<i64>(batch * 8)?,
+-            pick_keys: s.alloc_zeros::<i64>(batch * 8)?,
+-            x: s.alloc_zeros::<u8>(batch * p.m * p.k)?,
+-            idx: s.alloc_zeros::<u8>(batch * p.nb * 4)?,
+-            slices: s.alloc_zeros::<u32>(batch)?,
+-            c: s.alloc_zeros::<i32>(batch * p.m * p.nb)?,
+-            sums: s.alloc_zeros::<u64>(batch * 8)?,
++            slots,
++            next: 0,
++            queue: VecDeque::new(),
++            fused_fold,
++            profiling: false,
++            profile: GatherProfile::default(),
+         })
+     }
+ 
++    pub fn batch(&self) -> usize {
++        self.batch
++    }
++
++    /// Number of gathered batches submitted but not collected (0, 1 or 2).
++    pub fn in_flight(&self) -> usize {
++        self.queue.len()
++    }
++
++    /// Enables or disables stage profiling. Enabling resets the accumulated figures.
++    pub fn set_profiling(&mut self, enabled: bool) {
++        self.profiling = enabled;
++        self.profile = GatherProfile::default();
++    }
++
++    /// Returns and resets the accumulated profile.
++    pub fn take_profile(&mut self) -> GatherProfile {
++        std::mem::take(&mut self.profile)
++    }
++
+     /// A memory test: reads these seeds' columns as `attempts` does, `piece` bytes of each column at a time, with no
+     /// multiply (`gather_read`), and waits for it. `piece` must be a multiple of 16 that divides `k`, at most 1024.
+     pub fn read_only(&mut self, seeds: &[[u8; 32]], piece: usize) -> Result<(), GpuError> {
++        if !self.queue.is_empty() {
++            return Err(GpuError::new("a submitted batch was not collected"));
++        }
+         let p = self.data.params;
+         let n = seeds.len();
+         if n == 0 || n > self.batch {
+@@ -88,13 +213,16 @@ impl<'a> GatherEngine<'a> {
+         }
+         let gpu = self.gpu;
+         let stream = &gpu.stream;
+-        let pick: Vec<i64> = seeds
+-            .iter()
+-            .flat_map(|s| key_words_i64(&mh::pick_key(s)))
+-            .collect();
+-        stream.memcpy_htod(&pick, &mut self.pick_keys.slice_mut(0..n * 8))?;
++        let slot = &mut self.slots[0];
++        {
++            let host = slot.pick_keys_host.as_mut_slice()?;
++            for (i, seed) in seeds.iter().enumerate() {
++                host[i * 8..i * 8 + 8].copy_from_slice(&key_words_i64(&mh::pick_key(seed)));
++            }
++        }
++        stream.memcpy_htod(&slot.pick_keys_host, &mut slot.pick_keys)?;
+         let ipk = (p.nb / 16) as u64;
+-        gpu.launch_keystream(&self.pick_keys, &self.idx, ipk, 0, n as u64 * ipk)?;
++        gpu.launch_keystream(&slot.pick_keys, &slot.idx, ipk, 0, n as u64 * ipk)?;
+         let cfg = LaunchConfig {
+             grid_dim: ((p.nb / 128) as u32, n as u32, 1),
+             block_dim: (THREADS, 1, 1),
+@@ -104,7 +232,7 @@ impl<'a> GatherEngine<'a> {
+         let columns = (p.num_blocks * p.nb) as u32;
+         let mut b = stream.launch_builder(&gpu.read_fn);
+         b.arg(&self.data.buf)
+-            .arg(&self.idx)
++            .arg(&slot.idx)
+             .arg(&self.read_out)
+             .arg(&k)
+             .arg(&nb)
+@@ -152,82 +280,227 @@ impl<'a> GatherEngine<'a> {
+     }
+ 
+     fn run(&mut self, seeds: &[[u8; 32]], cols: Columns<'_>) -> Result<Vec<Attempt>, GpuError> {
++        if !self.queue.is_empty() {
++            return Err(GpuError::new("a submitted batch was not collected"));
++        }
++        let (same_columns, owned) = match cols {
++            Columns::Gathered { same } => (same, OwnedColumns::Gathered),
++            Columns::Slices(slices) => (false, OwnedColumns::Slices(slices.to_vec())),
++        };
++        self.submit_inner(seeds.to_vec(), same_columns, owned)?;
++        Ok(self.collect()?.expect("one batch was submitted"))
++    }
++
++    /// Queues one gathered batch and returns without waiting. At most two batches may be in flight. The seeds are kept
++    /// until collection so the CPU can finish `mix` and `digest` while the following batch is running on the GPU.
++    pub fn submit(&mut self, seeds: Vec<[u8; 32]>, same_columns: bool) -> Result<(), GpuError> {
++        self.submit_inner(seeds, same_columns, OwnedColumns::Gathered)
++    }
++
++    fn submit_inner(
++        &mut self,
++        seeds: Vec<[u8; 32]>,
++        same_columns: bool,
++        columns_kind: OwnedColumns,
++    ) -> Result<(), GpuError> {
+         let p = self.data.params;
+         let n = seeds.len();
+         if n == 0 || n > self.batch {
+             return Err(GpuError::new("between 1 and `batch` seeds"));
+         }
++        if self.queue.len() >= self.slots.len() {
++            return Err(GpuError::new(
++                "two batches are in flight: collect one first",
++            ));
++        }
++        if let OwnedColumns::Slices(slices) = &columns_kind {
++            if slices.len() != n {
++                return Err(GpuError::new("one slice for each seed"));
++            }
++            if slices.iter().any(|&b| b >= self.data.slices) {
++                return Err(GpuError::new("an attempt reads a slice that was not built"));
++            }
++        }
++
+         let gpu = self.gpu;
+         let stream = &gpu.stream;
+-        let keys: Vec<i64> = seeds.iter().flat_map(key_words_i64).collect();
+-        stream.memcpy_htod(&keys, &mut self.keys.slice_mut(0..n * 8))?;
+-        // X
++        let slot_index = self.next;
++        let slot = &mut self.slots[slot_index];
++        let prepare_keys = self.profiling.then(Instant::now);
++        {
++            let keys = slot.keys_host.as_mut_slice()?;
++            for (i, seed) in seeds.iter().enumerate() {
++                keys[i * 8..i * 8 + 8].copy_from_slice(&key_words_i64(seed));
++            }
++        }
++        if let Some(start) = prepare_keys {
++            self.profile.prepare_keys += start.elapsed();
++        }
++        let mut events = if self.profiling {
++            Some(vec![
++                stream.record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?
++            ])
++        } else {
++            None
++        };
++        let record = |events: &mut Option<Vec<CudaEvent>>| -> Result<(), GpuError> {
++            if let Some(events) = events {
++                events.push(stream.record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?);
++            }
++            Ok(())
++        };
++        stream.memcpy_htod(&slot.keys_host, &mut slot.keys)?;
++        record(&mut events)?;
++
++        // X: the ChaCha20 keystream keyed by each attempt seed.
+         let bpk = (p.m * p.k / 64) as u64;
+-        gpu.launch_keystream(&self.keys, &self.x, bpk, 0, n as u64 * bpk)?;
++        gpu.launch_keystream(&slot.keys, &slot.x, bpk, 0, n as u64 * bpk)?;
++        record(&mut events)?;
++
+         let nb = p.nb as u32;
+         let columns = (p.num_blocks * p.nb) as u32;
+-        let idx_stride: u32 = match cols {
+-            Columns::Gathered { same } => {
+-                // the column numbers: nb words per attempt, from the pick key's keystream
+-                let pick: Vec<i64> = seeds
+-                    .iter()
+-                    .flat_map(|s| key_words_i64(&mh::pick_key(s)))
+-                    .collect();
+-                stream.memcpy_htod(&pick, &mut self.pick_keys.slice_mut(0..n * 8))?;
+-                let ipk = (p.nb / 16) as u64;
+-                gpu.launch_keystream(&self.pick_keys, &self.idx, ipk, 0, n as u64 * ipk)?;
+-                if same {
+-                    0
+-                } else {
+-                    nb
++        let (idx_stride, slices) = match &columns_kind {
++            OwnedColumns::Gathered => {
++                // The column numbers: nb words per attempt, from the pick key's keystream.
++                let prepare_pick_keys = self.profiling.then(Instant::now);
++                {
++                    let pick_keys = slot.pick_keys_host.as_mut_slice()?;
++                    for (i, seed) in seeds.iter().enumerate() {
++                        pick_keys[i * 8..i * 8 + 8]
++                            .copy_from_slice(&key_words_i64(&mh::pick_key(seed)));
++                    }
+                 }
++                if let Some(start) = prepare_pick_keys {
++                    self.profile.prepare_pick_keys += start.elapsed();
++                }
++                stream.memcpy_htod(&slot.pick_keys_host, &mut slot.pick_keys)?;
++                record(&mut events)?;
++                let ipk = (p.nb / 16) as u64;
++                gpu.launch_keystream(&slot.pick_keys, &slot.idx, ipk, 0, n as u64 * ipk)?;
++                record(&mut events)?;
++                (if same_columns { 0 } else { nb }, None)
+             }
+-            Columns::Slices(slices) => {
+-                let s32: Vec<u32> = slices.iter().map(|&b| b as u32).collect();
+-                stream.memcpy_htod(&s32, &mut self.slices.slice_mut(0..n))?;
+-                0
++            OwnedColumns::Slices(slice_indexes) => {
++                let prepare_slices = self.profiling.then(Instant::now);
++                {
++                    let slices_host = slot.slices_host.as_mut_slice()?;
++                    for (out, &slice) in slices_host.iter_mut().zip(slice_indexes) {
++                        *out = slice as u32;
++                    }
++                }
++                if let Some(start) = prepare_slices {
++                    self.profile.prepare_pick_keys += start.elapsed();
++                }
++                stream.memcpy_htod(&slot.slices_host, &mut slot.slices)?;
++                record(&mut events)?;
++                // Keep the event layout identical; slice mode has no index-generation kernel.
++                record(&mut events)?;
++                (0, Some(&slot.slices))
+             }
+         };
+-        let slice_index_of = |i: usize| match cols {
+-            Columns::Slices(slices) => slices[i],
+-            Columns::Gathered { .. } => 0,
+-        };
+ 
+-        // SAFETY of the launch (`Gpu::launch_multiply`): m == 64, k % 128 == 0 and nb % 128 == 0 and the whole dataset
+-        // were checked in `new`; x, c, idx and slices hold `batch >= n` attempts' worth; slices were checked to be inside
+-        // the dataset in `slice_attempts`, and gathered columns are taken modulo `columns`, all inside the dataset.
+-        gpu.launch_multiply(
+-            &self.x,
+-            &self.data.buf,
+-            &self.idx,
+-            match cols {
+-                Columns::Slices(_) => Some(&self.slices),
+-                Columns::Gathered { .. } => None,
+-            },
+-            &self.c,
+-            (p.k, p.nb, columns as usize),
+-            idx_stride,
+-            n,
+-        )?;
+-
+-        stream.memset_zeros(&mut self.sums)?;
+-        gpu.launch_fold(&self.c, &self.sums, (p.m * p.nb / 16) as u64, n as u32)?;
+-        let sums = stream.clone_dtoh(&self.sums.slice(0..n * 8))?;
+-        Ok(seeds
++        // SAFETY of the launch (`Gpu::launch_multiply`): the shape and whole dataset were checked in `new`; every
++        // buffer holds `batch >= n` attempts; slice indexes were checked above and gathered indexes are reduced modulo
++        // `columns` in the kernel.
++        if self.fused_fold {
++            stream.memset_zeros(&mut slot.sums)?;
++            gpu.launch_multiply_fold(
++                &slot.x,
++                &self.data.buf,
++                &slot.idx,
++                slices,
++                &slot.sums,
++                (p.k, p.nb, columns as usize),
++                idx_stride,
++                n,
++            )?;
++            record(&mut events)?;
++            // Keep the profiling event layout identical. The fused kernel's complete time is reported as gather.
++            record(&mut events)?;
++        } else {
++            gpu.launch_multiply(
++                &slot.x,
++                &self.data.buf,
++                &slot.idx,
++                slices,
++                slot.c.as_ref().expect("the separate path allocates C"),
++                (p.k, p.nb, columns as usize),
++                idx_stride,
++                n,
++            )?;
++            record(&mut events)?;
++
++            stream.memset_zeros(&mut slot.sums)?;
++            gpu.launch_fold(
++                slot.c.as_ref().expect("the separate path allocates C"),
++                &slot.sums,
++                (p.m * p.nb / 16) as u64,
++                n as u32,
++            )?;
++            record(&mut events)?;
++        }
++        stream.memcpy_dtoh(&slot.sums, &mut slot.sums_host)?;
++        record(&mut events)?;
++
++        slot.pending = Some(Pending {
++            seeds,
++            columns: columns_kind,
++            events,
++        });
++        self.queue.push_back(slot_index);
++        self.next = (slot_index + 1) % self.slots.len();
++        Ok(())
++    }
++
++    /// Waits only for the oldest submitted batch's D→H copy, then computes its exact mix and digest on the CPU.
++    pub fn collect(&mut self) -> Result<Option<Vec<Attempt>>, GpuError> {
++        let Some(slot_index) = self.queue.pop_front() else {
++            return Ok(None);
++        };
++        let slot = &mut self.slots[slot_index];
++        let pending = slot.pending.take().expect("a queued slot has a batch");
++        let wait = Instant::now();
++        let sums_host = slot.sums_host.as_slice()?;
++        if self.profiling {
++            self.profile.collect_wait += wait.elapsed();
++        }
++        let n = pending.seeds.len();
++        if let Some(events) = &pending.events {
++            debug_assert_eq!(events.len(), 8);
++            self.profile.h_to_d_ms += f64::from(events[0].elapsed_ms(&events[1])?);
++            self.profile.x_ms += f64::from(events[1].elapsed_ms(&events[2])?);
++            self.profile.h_to_d_ms += f64::from(events[2].elapsed_ms(&events[3])?);
++            self.profile.indexes_ms += f64::from(events[3].elapsed_ms(&events[4])?);
++            self.profile.gather_gemm_ms += f64::from(events[4].elapsed_ms(&events[5])?);
++            self.profile.fold_ms += f64::from(events[5].elapsed_ms(&events[6])?);
++            self.profile.d_to_h_ms += f64::from(events[6].elapsed_ms(&events[7])?);
++            self.profile.batches += 1;
++            self.profile.attempts += n as u64;
++        }
++        let finalize = Instant::now();
++        let attempts = pending
++            .seeds
+             .iter()
+-            .zip(sums.chunks(8))
++            .zip(sums_host[..n * 8].chunks_exact(8))
+             .enumerate()
+-            .map(|(i, (seed, s))| {
+-                let sums: [u64; 8] = s.try_into().expect("8 sums");
++            .map(|(i, (seed, sums))| {
++                let sums: [u64; 8] = sums.try_into().expect("8 sums");
+                 let mix = mh::mix_bytes(&sums);
+                 Attempt {
+                     seed: *seed,
+-                    slice_index: slice_index_of(i),
++                    slice_index: match &pending.columns {
++                        OwnedColumns::Gathered => 0,
++                        OwnedColumns::Slices(slices) => slices[i],
++                    },
+                     sums,
+                     mix,
+                     digest: mh::digest_of(seed, &mix),
+                 }
+             })
+-            .collect())
++            .collect();
++        if self.profiling {
++            self.profile.mix_digest += finalize.elapsed();
++        }
++        Ok(Some(attempts))
+     }
+ }
+diff --git a/crates/tenero-gpu/src/lib.rs b/crates/tenero-gpu/src/lib.rs
+index d11b5f7..8b9ab67 100644
+--- a/crates/tenero-gpu/src/lib.rs
++++ b/crates/tenero-gpu/src/lib.rs
+@@ -101,6 +101,7 @@ pub struct Gpu {
+     fill_fn: CudaFunction,
+     fold_fn: CudaFunction,
+     gather_fn: CudaFunction,
++    gather_fold_fn: CudaFunction,
+     read_fn: CudaFunction,
+     pub name: String,
+     pub compute_capability: (i32, i32),
+@@ -139,6 +140,7 @@ impl Gpu {
+         let module = load(MATMULHASH_FATBIN)?;
+         let gather = load(GATHER_FATBIN)?;
+         let gather_fn = gather.load_function("gather_gemm")?;
++        let gather_fold_fn = gather.load_function("gather_gemm_fold")?;
+         // more than the default 48 KiB of shared memory (G_SMEM in gather.cu), and as much of the cache as shared memory
+         gather_fn.set_attribute(
+             CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+@@ -148,6 +150,14 @@ impl Gpu {
+             CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+             100,
+         )?;
++        gather_fold_fn.set_attribute(
++            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
++            GATHER_SMEM as i32,
++        )?;
++        gather_fold_fn.set_attribute(
++            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
++            100,
++        )?;
+         Ok(Gpu {
+             stream: ctx.new_stream()?,
+             // the fast versions: the same arguments and results as keystream_kernel and fold_kernel
+@@ -155,6 +165,7 @@ impl Gpu {
+             fill_fn: module.load_function("fill_kernel")?,
+             fold_fn: module.load_function("fold_fast")?,
+             gather_fn,
++            gather_fold_fn,
+             read_fn: gather.load_function("gather_read")?,
+             name,
+             compute_capability,
+@@ -212,6 +223,51 @@ impl Gpu {
+         Ok(())
+     }
+ 
++    /// Exact fused `gather_gemm + fold_fast`: writes only the eight sums per attempt, not the intermediate C matrix.
++    /// The caller zeroes `sums` before this launch. Argument and shape requirements otherwise match `launch_multiply`.
++    #[allow(clippy::too_many_arguments)]
++    fn launch_multiply_fold(
++        &self,
++        x: &CudaSlice<u8>,
++        data: &CudaSlice<u8>,
++        idx: &CudaSlice<u8>,
++        slices: Option<&CudaSlice<u32>>,
++        sums: &CudaSlice<u64>,
++        (k, nb, columns): (usize, usize, usize),
++        idx_stride: u32,
++        n: usize,
++    ) -> Result<(), GpuError> {
++        let cfg = LaunchConfig {
++            grid_dim: ((nb / 128) as u32, n as u32, 1),
++            block_dim: (THREADS, 1, 1),
++            shared_mem_bytes: GATHER_SMEM,
++        };
++        let (k, nb, columns) = (k as u32, nb as u32, columns as u32);
++        let slice_mode: u32 = u32::from(slices.is_some());
++        let mut b = self.stream.launch_builder(&self.gather_fold_fn);
++        b.arg(x)
++            .arg(data)
++            .arg(idx)
++            .arg(sums)
++            .arg(&k)
++            .arg(&nb)
++            .arg(&columns)
++            .arg(&idx_stride);
++        match slices {
++            Some(s) => b.arg(s),
++            None => b.arg(idx),
++        };
++        b.arg(&slice_mode);
++        // SAFETY: the kernel arguments and all multiply inputs have the same requirements as `launch_multiply`.
++        // `sums` holds n * 8 zeroed u64 values. Each block stages its complete 64 x 128 C tile within GATHER_SMEM,
++        // folds it, and atomically adds eight values inside its attempt's sums.
++        #[allow(unsafe_code)]
++        unsafe {
++            b.launch(cfg)?;
++        }
++        Ok(())
++    }
++
+     pub fn synchronize(&self) -> Result<(), GpuError> {
+         Ok(self.stream.synchronize()?)
+     }
+diff --git a/crates/tenero-gpu/tests/gather_selftest.rs b/crates/tenero-gpu/tests/gather_selftest.rs
+index 8f5dd08..d24f512 100644
+--- a/crates/tenero-gpu/tests/gather_selftest.rs
++++ b/crates/tenero-gpu/tests/gather_selftest.rs
+@@ -14,20 +14,26 @@ fn check(p: Params, attempts: usize, batch: usize) {
+     let seed = mh::epoch_seed(3);
+     let cpu = Dataset::build(&p, &seed, p.num_blocks, 6).unwrap();
+     let dev = g.build_dataset(&p, &seed, p.num_blocks).unwrap();
+-    let mut engine = GatherEngine::new(&g, &dev, batch).unwrap();
+     let header = [0x77u8; 32];
+     let nonces: Vec<u64> = (0..attempts as u64)
+         .map(|n| n.wrapping_add(u64::MAX - 3))
+         .collect();
+-    for chunk in nonces.chunks(batch) {
+-        let seeds: Vec<[u8; 32]> = chunk
+-            .iter()
+-            .map(|&n| mh::attempt_seed(&header, n))
+-            .collect();
+-        let got = engine.attempts(&seeds, false).unwrap();
+-        for (&nonce, a) in chunk.iter().zip(&got) {
+-            let want = mh::compute_gathered_attempt(&cpu, &header, nonce).unwrap();
+-            assert_eq!(*a, want, "{p:?} nonce {nonce}");
++    for fused in [false, true] {
++        let mut engine = if fused {
++            GatherEngine::new_fused(&g, &dev, batch).unwrap()
++        } else {
++            GatherEngine::new(&g, &dev, batch).unwrap()
++        };
++        for chunk in nonces.chunks(batch) {
++            let seeds: Vec<[u8; 32]> = chunk
++                .iter()
++                .map(|&n| mh::attempt_seed(&header, n))
++                .collect();
++            let got = engine.attempts(&seeds, false).unwrap();
++            for (&nonce, a) in chunk.iter().zip(&got) {
++                let want = mh::compute_gathered_attempt(&cpu, &header, nonce).unwrap();
++                assert_eq!(*a, want, "{p:?} fused {fused}, nonce {nonce}");
++            }
+         }
+     }
+ }
+@@ -58,12 +64,105 @@ fn the_gathered_multiply_matches_the_cpu_on_small_shapes() {
+     );
+ }
+ 
++#[test]
++#[ignore = "needs an NVIDIA GPU"]
++fn two_gathered_batches_in_flight_match_the_cpu_and_keep_their_order() {
++    let p = Params {
++        m: 64,
++        k: 1024,
++        nb: 256,
++        num_blocks: 8,
++    };
++    let g = Gpu::new(0).expect("a GPU");
++    let epoch_seed = mh::epoch_seed(7);
++    let cpu = Dataset::build(&p, &epoch_seed, p.num_blocks, 6).unwrap();
++    let dev = g.build_dataset(&p, &epoch_seed, p.num_blocks).unwrap();
++    let batch = 17;
++    let mut engine = GatherEngine::new_fused(&g, &dev, batch).unwrap();
++    let header = [0xa5; 32];
++
++    // Deterministic, widely separated nonces, including wraparound. This catches slot/order/batch-boundary mistakes
++    // without adding a random-number dependency to the GPU crate.
++    let mut state = 0x9e37_79b9_7f4a_7c15u64;
++    let mut nonces = Vec::new();
++    for _ in 0..(batch * 5 + 3) {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        nonces.push(state);
++    }
++    nonces.extend([u64::MAX - 1, u64::MAX, 0, 1]);
++
++    let mut submitted = 0;
++    let mut collected = 0;
++    while collected < nonces.len() {
++        while engine.in_flight() < 2 && submitted < nonces.len() {
++            let end = (submitted + batch).min(nonces.len());
++            let seeds = nonces[submitted..end]
++                .iter()
++                .map(|&nonce| mh::attempt_seed(&header, nonce))
++                .collect();
++            engine.submit(seeds, false).unwrap();
++            submitted = end;
++        }
++        let got = engine.collect().unwrap().expect("a queued batch");
++        for attempt in got {
++            let nonce = nonces[collected];
++            let want = mh::compute_gathered_attempt(&cpu, &header, nonce).unwrap();
++            assert_eq!(
++                attempt, want,
++                "pipeline position {collected}, nonce {nonce}"
++            );
++            collected += 1;
++        }
++    }
++    assert_eq!(engine.in_flight(), 0);
++    assert!(engine.collect().unwrap().is_none());
++}
++
+ #[test]
+ #[ignore = "needs an NVIDIA GPU and about 4.5 GiB of RAM and of video memory"]
+ fn the_gathered_multiply_matches_the_cpu_at_the_real_parameters() {
+     check(Params::DEFAULT, 3, 3);
+ }
+ 
++#[test]
++#[ignore = "needs an NVIDIA GPU and about 5 GiB of video memory"]
++fn fused_and_separate_match_on_many_real_attempts_and_epochs() {
++    let p = Params::DEFAULT;
++    let g = Gpu::new(0).expect("a GPU");
++    let batch = 128;
++    let mut state = 0xd1b5_4a32_d192_ed03u64;
++
++    for epoch in [0, 7, 65_537] {
++        let dev = g
++            .build_dataset(&p, &mh::epoch_seed(epoch), p.num_blocks)
++            .unwrap();
++        let mut separate = GatherEngine::new(&g, &dev, batch).unwrap();
++        let mut fused = GatherEngine::new_fused(&g, &dev, batch).unwrap();
++        for header_tag in [0x11u8, 0x80, 0xfe] {
++            let header = [header_tag; 32];
++            let mut nonces = Vec::with_capacity(batch + 3);
++            for _ in 0..batch {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                nonces.push(state);
++            }
++            nonces.extend([u64::MAX, 0, 1]);
++            for chunk in nonces.chunks(batch) {
++                let seeds: Vec<[u8; 32]> = chunk
++                    .iter()
++                    .map(|&nonce| mh::attempt_seed(&header, nonce))
++                    .collect();
++                let want = separate.attempts(&seeds, false).unwrap();
++                let got = fused.attempts(&seeds, false).unwrap();
++                assert_eq!(got, want, "epoch {epoch}, header {header_tag:#04x}");
++            }
++        }
++    }
++}
++
+ /// The FIRST design (each attempt reads its whole slice) on our own multiply, as the miner runs it without cuBLASLt:
+ /// nonces grouped by slice, every attempt against `matmulhash::compute_attempt`, bit for bit.
+ fn check_slices(p: Params, group: usize, batch: usize, batches: usize) {
+diff --git a/crates/tenero-miner/src/gpu.rs b/crates/tenero-miner/src/gpu.rs
+index fb706f9..ff0da56 100644
+--- a/crates/tenero-miner/src/gpu.rs
++++ b/crates/tenero-miner/src/gpu.rs
+@@ -15,7 +15,10 @@
+ 
+ use std::collections::VecDeque;
+ use std::sync::atomic::Ordering;
++use std::sync::mpsc::{channel, Receiver, Sender};
+ use std::sync::Arc;
++use std::thread::{self, JoinHandle};
++use std::time::Duration;
+ 
+ use tenero_core::matmulhash::{self as mh, Params};
+ use tenero_core::v3::ids;
+@@ -175,7 +178,8 @@ impl Backend for GpuBackend {
+     }
+ }
+ 
+-/// A job at or above the gather fork: nonces in plain order (grouping cannot help a gathered attempt), one batch at a time.
++/// A job at or above the gather fork: nonces in plain order (grouping cannot help a gathered attempt), with two batches
++/// queued. While the GPU runs the newer batch, the CPU finalizes and target-checks the older one.
+ fn mine_gathered(
+     gpu: &Gpu,
+     data: &DeviceDataset,
+@@ -184,17 +188,31 @@ fn mine_gathered(
+     job: &Job,
+     counters: &Counters,
+ ) -> Result<Option<Solution>, String> {
+-    let mut engine = GatherEngine::new(gpu, data, batch).map_err(|e| e.to_string())?;
++    let mut engine = GatherEngine::new_fused(gpu, data, batch).map_err(|e| e.to_string())?;
+     let mut nonce = job.first_nonce();
++    let mut in_flight: VecDeque<u64> = VecDeque::new();
+     loop {
+         if job.stale.load(Ordering::SeqCst) {
+             return Ok(None);
+         }
+-        let nonces: Vec<u64> = (0..batch as u64).map(|i| nonce.wrapping_add(i)).collect();
+-        let seeds: Vec<[u8; 32]> = nonces.iter().map(|&n| mh::attempt_seed(hh, n)).collect();
+-        let attempts = engine.attempts(&seeds, false).map_err(|e| e.to_string())?;
++        while engine.in_flight() < 2 {
++            let first_nonce = nonce;
++            let seeds: Vec<[u8; 32]> = (0..batch as u64)
++                .map(|i| mh::attempt_seed(hh, first_nonce.wrapping_add(i)))
++                .collect();
++            engine.submit(seeds, false).map_err(|e| e.to_string())?;
++            in_flight.push_back(first_nonce);
++            nonce = nonce.wrapping_add(batch as u64);
++        }
++        let attempts = engine
++            .collect()
++            .map_err(|e| e.to_string())?
++            .ok_or("the GPU gather engine lost a batch")?;
++        let first_nonce = in_flight
++            .pop_front()
++            .ok_or("the GPU gather engine lost a batch")?;
+         counters.attempts.fetch_add(batch as u64, Ordering::Relaxed);
+-        for (i, (n, a)) in nonces.iter().zip(&attempts).enumerate() {
++        for (i, a) in attempts.iter().enumerate() {
+             if mh::meets_target(&a.digest, &job.target) {
+                 // the rest of the batch was made, but cannot make another block of this job
+                 counters
+@@ -203,12 +221,240 @@ fn mine_gathered(
+                 counters.found.fetch_add(1, Ordering::Relaxed);
+                 return Ok(Some(Solution {
+                     job_id: job.id,
+-                    nonce: *n,
++                    nonce: first_nonce.wrapping_add(i as u64),
+                     mix: a.mix,
+                 }));
+             }
+         }
+-        nonce = nonce.wrapping_add(batch as u64);
++    }
++}
++
++// ---- old3n multi-GPU backend --------------------------------------------------------------------------------------------
++// One Miner/RemoteMiner drives this backend, so a remote node sees ONE connection.
++// Every GPU owns its CUDA context on a permanent worker thread.
++
++enum MultiGpuCommand {
++    Mine(Job),
++    Stop,
++}
++
++enum MultiGpuMessage {
++    Ready(String),
++    Solved(Solution),
++    Finished(u64),
++    Failed(String),
++}
++
++struct MultiGpuWorker {
++    tx: Sender<MultiGpuCommand>,
++    rx: Receiver<MultiGpuMessage>,
++    handle: Option<JoinHandle<()>>,
++    counters: Arc<Counters>,
++    last_attempts: u64,
++    last_discarded: u64,
++    last_dataset_builds: u64,
++    last_prefetches: u64,
++    last_build_marks: u64,
++}
++
++pub struct MultiGpuBackend {
++    workers: Vec<MultiGpuWorker>,
++    name: String,
++}
++
++impl MultiGpuBackend {
++    pub fn new(
++        devices: &[(usize, usize)],
++        params: Params,
++        epoch_blocks: u64,
++        gather_from: u64,
++    ) -> Result<MultiGpuBackend, String> {
++        if devices.is_empty() {
++            return Err("multi-GPU needs at least one device".into());
++        }
++        if devices.len() > 256 {
++            return Err("multi-GPU supports at most 256 devices".into());
++        }
++
++        let mut workers = Vec::with_capacity(devices.len());
++        for &(ordinal, batch) in devices {
++            let (cmd_tx, cmd_rx) = channel::<MultiGpuCommand>();
++            let (msg_tx, msg_rx) = channel::<MultiGpuMessage>();
++            let counters = Arc::new(Counters::default());
++            let wc = Arc::clone(&counters);
++
++            let handle = thread::spawn(move || {
++                let mut backend = match GpuBackend::new(ordinal, params, epoch_blocks, batch)
++                    .map(|b| b.gathered_from(gather_from))
++                {
++                    Ok(b) => b,
++                    Err(e) => {
++                        let _ = msg_tx.send(MultiGpuMessage::Failed(format!("GPU {ordinal}: {e}")));
++                        return;
++                    }
++                };
++
++                let _ = msg_tx.send(MultiGpuMessage::Ready(format!(
++                    "GPU {ordinal}: {}",
++                    backend.name()
++                )));
++
++                while let Ok(cmd) = cmd_rx.recv() {
++                    match cmd {
++                        MultiGpuCommand::Mine(job) => {
++                            let id = job.id;
++                            match backend.mine(&job, &wc) {
++                                Ok(Some(sol)) => {
++                                    let _ = msg_tx.send(MultiGpuMessage::Solved(sol));
++                                }
++                                Ok(None) => {}
++                                Err(e) => {
++                                    let _ = msg_tx.send(MultiGpuMessage::Failed(format!(
++                                        "GPU {ordinal}: {e}"
++                                    )));
++                                    return;
++                                }
++                            }
++                            let _ = msg_tx.send(MultiGpuMessage::Finished(id));
++                        }
++                        MultiGpuCommand::Stop => return,
++                    }
++                }
++            });
++
++            workers.push(MultiGpuWorker {
++                tx: cmd_tx,
++                rx: msg_rx,
++                handle: Some(handle),
++                counters,
++                last_attempts: 0,
++                last_discarded: 0,
++                last_dataset_builds: 0,
++                last_prefetches: 0,
++                last_build_marks: 0,
++            });
++        }
++
++        let mut names = Vec::with_capacity(workers.len());
++        for w in &workers {
++            match w.rx.recv_timeout(Duration::from_secs(30)) {
++                Ok(MultiGpuMessage::Ready(name)) => names.push(name),
++                Ok(MultiGpuMessage::Failed(e)) => return Err(e),
++                Ok(_) => return Err("multi-GPU worker sent an unexpected startup message".into()),
++                Err(e) => return Err(format!("multi-GPU worker did not start: {e}")),
++            }
++        }
++
++        Ok(MultiGpuBackend {
++            name: format!("matmulhash on {} GPUs [{}]", names.len(), names.join(" | ")),
++            workers,
++        })
++    }
++
++    fn sync_counters(&mut self, out: &Counters) {
++        for w in &mut self.workers {
++            let now = w.counters.attempts.load(Ordering::Relaxed);
++            out.attempts
++                .fetch_add(now.saturating_sub(w.last_attempts), Ordering::Relaxed);
++            w.last_attempts = now;
++
++            let now = w.counters.discarded.load(Ordering::Relaxed);
++            out.discarded
++                .fetch_add(now.saturating_sub(w.last_discarded), Ordering::Relaxed);
++            w.last_discarded = now;
++
++            let now = w.counters.dataset_builds.load(Ordering::Relaxed);
++            out.dataset_builds
++                .fetch_add(now.saturating_sub(w.last_dataset_builds), Ordering::Relaxed);
++            w.last_dataset_builds = now;
++
++            let now = w.counters.prefetches.load(Ordering::Relaxed);
++            out.prefetches
++                .fetch_add(now.saturating_sub(w.last_prefetches), Ordering::Relaxed);
++            w.last_prefetches = now;
++
++            let now = w.counters.build_marks.load(Ordering::Relaxed);
++            out.build_marks
++                .fetch_add(now.saturating_sub(w.last_build_marks), Ordering::Relaxed);
++            w.last_build_marks = now;
++        }
++    }
++}
++
++impl Backend for MultiGpuBackend {
++    fn name(&self) -> String {
++        self.name.clone()
++    }
++
++    fn mine(&mut self, job: &Job, counters: &Counters) -> Result<Option<Solution>, String> {
++        const SEGMENT: u64 = 1u64 << 56;
++        let base = job.first_nonce();
++
++        for (slot, w) in self.workers.iter().enumerate() {
++            let mut sub = job.clone();
++            sub.nonce_start = Some(base.wrapping_add((slot as u64).wrapping_mul(SEGMENT)));
++            w.tx.send(MultiGpuCommand::Mine(sub))
++                .map_err(|_| format!("GPU worker {slot} stopped"))?;
++        }
++
++        let mut active = self.workers.len();
++        let mut solution = None;
++
++        while active != 0 {
++            let mut failed = None;
++            for w in &mut self.workers {
++                while let Ok(msg) = w.rx.try_recv() {
++                    match msg {
++                        MultiGpuMessage::Ready(_) => {}
++                        MultiGpuMessage::Solved(sol) => {
++                            if solution.is_none() {
++                                solution = Some(sol);
++                                job.stale.store(true, Ordering::SeqCst);
++                            }
++                        }
++                        MultiGpuMessage::Finished(id) if id == job.id => {
++                            active = active.saturating_sub(1);
++                        }
++                        MultiGpuMessage::Finished(_) => {}
++                        MultiGpuMessage::Failed(e) => {
++                            failed = Some(e);
++                            break;
++                        }
++                    }
++                }
++                if failed.is_some() {
++                    break;
++                }
++            }
++
++            self.sync_counters(counters);
++            if let Some(e) = failed {
++                job.stale.store(true, Ordering::SeqCst);
++                return Err(e);
++            }
++            if active != 0 {
++                thread::sleep(Duration::from_millis(2));
++            }
++        }
++
++        self.sync_counters(counters);
++        if solution.is_some() {
++            counters.found.fetch_add(1, Ordering::Relaxed);
++        }
++        Ok(solution)
++    }
++}
++
++impl Drop for MultiGpuBackend {
++    fn drop(&mut self) {
++        for w in &self.workers {
++            let _ = w.tx.send(MultiGpuCommand::Stop);
++        }
++        for w in &mut self.workers {
++            if let Some(h) = w.handle.take() {
++                let _ = h.join();
++            }
++        }
+     }
+ }
+ 
