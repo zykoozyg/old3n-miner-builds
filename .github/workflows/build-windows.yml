@@ -1,0 +1,117 @@
+name: Build old3n-miner Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v4
+
+      - name: Install CUDA 12.6.3
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.6.3'
+          method: 'local'
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+          nvcc --version
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+      - name: Clone Tenero gamma.1
+        shell: pwsh
+        run: |
+          git clone https://github.com/zad112/Tenero.git Tenero-src-gamma1
+          Set-Location Tenero-src-gamma1
+          git checkout v0.3.0-gamma.1
+          git status --short
+
+      - name: Apply old3n patch
+        shell: pwsh
+        run: |
+          Set-Location Tenero-src-gamma1
+          git apply --check ..\SOURCE-PATCH.diff
+          git apply ..\SOURCE-PATCH.diff
+          git status --short
+
+      - name: Format check
+        shell: pwsh
+        run: |
+          Set-Location Tenero-src-gamma1
+          cargo fmt --all -- --check
+
+      - name: Cargo check
+        shell: pwsh
+        run: |
+          Set-Location Tenero-src-gamma1
+          cargo check --locked -p tenero-app --bin tenero-miner
+
+      - name: Build release
+        shell: pwsh
+        run: |
+          Set-Location Tenero-src-gamma1
+          cargo build --release --locked -p tenero-app --bin tenero-miner
+
+      - name: Package old3n-miner.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item Tenero-src-gamma1\target\release\tenero-miner.exe package\old3n-miner.exe
+          Copy-Item SOURCE-PATCH.diff package\SOURCE-PATCH.diff
+
+          @"
+          old3n-miner gamma.1 - Windows x64
+          ==================================
+
+          Based on Tenero v0.3.0-gamma.1.
+
+          Includes:
+          - old3n optimized fused GPU path
+          - double-buffered gathered pipeline
+          - native multi-GPU support
+          - one node/remote-node connection for multiple GPUs
+
+          Multi-GPU example:
+
+          old3n-miner.exe ^
+            --node HOST:38334 ^
+            --key REMOTE_MINER_KEY ^
+            --address TENg... ^
+            --backend gpu ^
+            --gpu-devices 0,1 ^
+            --gpu-batches 512,512 ^
+            --status-every 30
+
+          Multi-GPU --pool mode is not enabled in this build.
+
+          Experimental / unaudited.
+          "@ | Set-Content -Encoding UTF8 package\README-WINDOWS.txt
+
+          $hash = (Get-FileHash package\old3n-miner.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  old3n-miner.exe" | Set-Content -Encoding ASCII package\SHA256SUMS
+
+          Compress-Archive -Path package\* -DestinationPath old3n-miner-gamma1-windows-x64.zip -Force
+
+          Write-Host "EXE SHA256:"
+          Get-Content package\SHA256SUMS
+          Write-Host "ZIP SHA256:"
+          Get-FileHash old3n-miner-gamma1-windows-x64.zip -Algorithm SHA256
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: old3n-miner-gamma1-windows-x64
+          path: old3n-miner-gamma1-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
